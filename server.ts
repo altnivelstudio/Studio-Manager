@@ -1,5 +1,4 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import dotenv from "dotenv";
 import path from "path";
@@ -31,26 +30,34 @@ app.get("/api/proxy-csv", async (req, res) => {
 });
 
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
+  // Check if we are in development and NOT on Vercel
+  if (process.env.NODE_ENV !== "production" && process.env.VERCEL !== "1") {
+    try {
+      // Dynamic import for Vite to avoid loading it in production
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } catch (e) {
+      console.warn("Vite not found, skipping middleware");
+    }
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
+    // In production, serve static files from dist
+    const distPath = path.join(__dirname, "dist");
+    app.use(express.static(distPath));
     
-    // Handle SPA routing - redirect all non-API requests to index.html
     app.get("*", (req, res) => {
       if (req.path.startsWith("/api")) {
         return res.status(404).json({ error: "API route not found" });
       }
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   // Only listen if not running as a Vercel function
-  if (process.env.VITE_VERCEL !== "true") {
+  if (process.env.VERCEL !== "1") {
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
     });
