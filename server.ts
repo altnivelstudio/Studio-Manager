@@ -49,9 +49,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
-  });
+  // Only listen if not running as a Vercel function
+  if (process.env.VITE_VERCEL !== "true") {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running in ${process.env.NODE_ENV || 'development'} mode on http://localhost:${PORT}`);
+    });
+  }
 }
 
 startServer();
+
+export default app;
