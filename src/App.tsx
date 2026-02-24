@@ -25,11 +25,16 @@ import {
   Database,
   Download,
   Upload,
+  LogOut,
+  Shield,
+  Loader2,
   Link as LinkIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
+import { supabase } from './supabaseClient';
+import { Auth } from './Auth';
 import { 
   Freelancer, 
   ExternalProject, 
@@ -37,7 +42,9 @@ import {
   FixedCost, 
   ServiceType,
   ProjectShare,
-  AppSettings
+  AppSettings,
+  UserProfile,
+  UserRole
 } from './types';
 
 // Initial Mock Data
@@ -58,7 +65,83 @@ const getToday = () => new Date().toISOString().slice(0, 10);
 
 const INITIAL_FIXED_COSTS: FixedCost[] = [];
 
+const UserManagement: React.FC<{ freelancers: Freelancer[] }> = ({ freelancers }) => {
+  const [profiles, setProfiles] = useState<UserProfile[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchProfiles();
+  }, []);
+
+  const fetchProfiles = async () => {
+    setLoading(true);
+    const { data, error } = await supabase.from('app_users').select('*');
+    if (!error && data) setProfiles(data);
+    setLoading(false);
+  };
+
+  const updateRole = async (userId: string, role: UserRole) => {
+    const { error } = await supabase.from('app_users').update({ role }).eq('id', userId);
+    if (!error) fetchProfiles();
+  };
+
+  const updateFreelancerLink = async (userId: string, freelancerId: string) => {
+    const { error } = await supabase.from('app_users').update({ freelancer_id: freelancerId === 'none' ? null : freelancerId }).eq('id', userId);
+    if (!error) fetchProfiles();
+  };
+
+  if (loading) return <div className="flex justify-center p-8"><Loader2 className="animate-spin text-indigo-600" /></div>;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left border-collapse">
+        <thead>
+          <tr className="border-b border-zinc-800">
+            <th className="py-3 px-4 text-[10px] font-bold uppercase text-zinc-500">Email</th>
+            <th className="py-3 px-4 text-[10px] font-bold uppercase text-zinc-500">Rol</th>
+            <th className="py-3 px-4 text-[10px] font-bold uppercase text-zinc-500">Asociere Freelancer</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-zinc-800">
+          {profiles.map(p => (
+            <tr key={p.id} className="text-sm">
+              <td className="py-3 px-4 text-zinc-300">{p.freelancer_id}</td>
+              <td className="py-3 px-4">
+                <select 
+                  value={p.role} 
+                  onChange={(e) => updateRole(p.id, e.target.value as UserRole)}
+                  className="bg-zinc-800 border-none rounded px-2 py-1 text-xs text-white"
+                >
+                  <option value="SUPERADMIN">Superadmin</option>
+                  <option value="ADMIN">Admin</option>
+                  <option value="COLLABORATOR">Colaborator</option>
+                </select>
+              </td>
+              <td className="py-3 px-4">
+                <select 
+                  value={p.freelancer_id || 'none'} 
+                  onChange={(e) => updateFreelancerLink(p.id, e.target.value)}
+                  className="bg-zinc-800 border-none rounded px-2 py-1 text-xs text-white"
+                >
+                  <option value="none">Nicio asociere</option>
+                  {freelancers.map(f => (
+                    <option key={f.id} value={f.id}>{f.name}</option>
+                  ))}
+                </select>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
 export default function App() {
+  const [session, setSession] = useState<any>(null);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
+
   const [freelancers, setFreelancers] = useState<Freelancer[]>(INITIAL_FREELANCERS);
   const [projects, setProjects] = useState<ExternalProject[]>([]);
   const [transactions, setTransactions] = useState<InternalTransaction[]>([]);
@@ -80,6 +163,9 @@ export default function App() {
 
   const [settings, setSettings] = useState<AppSettings>({ lastImportUrl: '' });
   const [isImporting, setIsImporting] = useState(false);
+  const [dbStatus, setDbStatus] = useState<'idle' | 'syncing' | 'error' | 'success'>('idle');
+  const [lastSyncError, setLastSyncError] = useState<string | null>(null);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [importTarget, setImportTarget] = useState<'projects' | 'internal' | 'costs' | null>(null);
@@ -92,6 +178,13 @@ export default function App() {
   // State for project form real-time calculation
   const [projectFormValue, setProjectFormValue] = useState<number>(0);
   const [projectFormShares, setProjectFormShares] = useState<Record<string, number>>({});
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  }>({ isOpen: false, title: '', message: '', onConfirm: () => {} });
+  const [errorToast, setErrorToast] = useState<string | null>(null);
 
   // Filter data by date range and filters
   const filteredProjects = useMemo(() => {
@@ -122,29 +215,143 @@ export default function App() {
     });
   }, [fixedCosts, dateRange, costFilters]);
 
-  // Load from localStorage
+  // Auth state listener
   useEffect(() => {
-    const saved = localStorage.getItem('hub_finance_data_v3');
-    if (saved) {
-      const data = JSON.parse(saved);
-      setFreelancers(data.freelancers || INITIAL_FREELANCERS);
-      setProjects(data.projects || []);
-      setTransactions(data.transactions || []);
-      setFixedCosts(data.fixedCosts || INITIAL_FIXED_COSTS);
-      setSettings(data.settings || { lastImportUrl: '' });
+    const savedUser = localStorage.getItem('hub_user_session');
+    if (savedUser) {
+      const user = JSON.parse(savedUser);
+      setSession(user);
+      setProfile(user);
     }
+    setIsAuthLoading(false);
   }, []);
 
-  // Save to localStorage
+  const handleLogin = (userData: any) => {
+    const user = {
+      id: userData.id,
+      email: userData.freelancer_id,
+      role: userData.role,
+      freelancer_id: userData.freelancer_id,
+      name: userData.freelancers?.name || userData.freelancer_id
+    };
+    setSession(user);
+    setProfile(user);
+    localStorage.setItem('hub_user_session', JSON.stringify(user));
+  };
+
+  const handleLogout = () => {
+    setSession(null);
+    setProfile(null);
+    localStorage.removeItem('hub_user_session');
+  };
+
+  // Load from Supabase
+  const fetchData = async () => {
+    if (!session) return;
+    setDbStatus('syncing');
+    try {
+      const [
+        fRes,
+        pRes,
+        tRes,
+        cRes,
+        sRes
+      ] = await Promise.all([
+        supabase.from('freelancers').select('*'),
+        supabase.from('projects').select('*'),
+        supabase.from('transactions').select('*'),
+        supabase.from('fixed_costs').select('*'),
+        supabase.from('settings').select('*').eq('id', 'default').maybeSingle()
+      ]);
+
+      // Check for errors in individual requests
+      const errors = [fRes, pRes, tRes, cRes].filter(r => r.error).map(r => r.error?.message);
+      if (errors.length > 0) {
+        throw new Error(`Eroare tabele: ${errors.join(', ')}`);
+      }
+
+      if (fRes.data && fRes.data.length > 0) {
+        setFreelancers(fRes.data);
+      } else if (fRes.data) {
+        // Seed initial freelancers if empty
+        await supabase.from('freelancers').insert(INITIAL_FREELANCERS);
+        setFreelancers(INITIAL_FREELANCERS);
+      }
+
+      if (pRes.data) setProjects(pRes.data);
+      if (tRes.data) setTransactions(tRes.data);
+      if (cRes.data) setFixedCosts(cRes.data);
+      if (sRes.data) setSettings(sRes.data);
+      
+      setDbStatus('success');
+      setIsInitialLoad(false);
+    } catch (error: any) {
+      console.error('Error fetching data from Supabase:', error);
+      setDbStatus('error');
+      setLastSyncError(error.message || 'Eroare la incarcarea datelor');
+      
+      // Fallback to localStorage
+      const saved = localStorage.getItem('hub_finance_data_v3');
+      if (saved) {
+        const data = JSON.parse(saved);
+        setFreelancers(data.freelancers || INITIAL_FREELANCERS);
+        setProjects(data.projects || []);
+        setTransactions(data.transactions || []);
+        setFixedCosts(data.fixedCosts || INITIAL_FIXED_COSTS);
+        setSettings(data.settings || { lastImportUrl: '' });
+      }
+      setIsInitialLoad(false);
+    }
+  };
+
   useEffect(() => {
-    localStorage.setItem('hub_finance_data_v3', JSON.stringify({
-      freelancers,
-      projects,
-      transactions,
-      fixedCosts,
-      settings
-    }));
-  }, [freelancers, projects, transactions, fixedCosts, settings]);
+    if (session) fetchData();
+  }, [session]);
+
+  // Sync to Supabase on changes
+  useEffect(() => {
+    if (isInitialLoad || !session || profile?.role === 'COLLABORATOR') return; // Prevent overwriting DB with empty state on mount or if collaborator
+
+    const syncData = async () => {
+      setDbStatus('syncing');
+      try {
+        const results = await Promise.all([
+          supabase.from('freelancers').upsert(freelancers),
+          supabase.from('projects').upsert(projects),
+          supabase.from('transactions').upsert(transactions),
+          supabase.from('fixed_costs').upsert(fixedCosts),
+          supabase.from('settings').upsert({ id: 'default', ...settings })
+        ]);
+
+        const errors = results.filter(r => r.error).map(r => r.error?.message);
+        
+        if (errors.length > 0) {
+          console.error('Supabase Sync Errors:', errors);
+          setDbStatus('error');
+          setLastSyncError(errors.join(', '));
+        } else {
+          setDbStatus('success');
+          setLastSyncError(null);
+        }
+        
+        // Also keep localStorage as backup
+        localStorage.setItem('hub_finance_data_v3', JSON.stringify({
+          freelancers,
+          projects,
+          transactions,
+          fixedCosts,
+          settings
+        }));
+      } catch (error: any) {
+        console.error('Error syncing data to Supabase:', error);
+        setDbStatus('error');
+        setLastSyncError(error.message || 'Unknown error');
+      }
+    };
+
+    const timeoutId = setTimeout(syncData, 2000);
+    return () => clearTimeout(timeoutId);
+  }, [freelancers, projects, transactions, fixedCosts, settings, isInitialLoad]);
 
   const exportToExcel = () => {
     const wb = XLSX.utils.book_new();
@@ -470,15 +677,22 @@ export default function App() {
       }
     });
 
+    // 6. Filter for collaborator view
+    let finalSettlements = settlements;
+    if (profile?.role === 'COLLABORATOR' && profile.freelancer_id) {
+      const myName = freelancers.find(f => f.id === profile.freelancer_id)?.name;
+      finalSettlements = settlements.filter(s => s.from === myName || s.to === myName);
+    }
+
     return {
       totalExternalIncome: Math.round(totalExternalIncome),
       totalHubContributions: Math.round(totalHubContributions),
       totalFixedCosts: Math.round(totalFixedCosts),
       hubBalance: Math.round(hubBalance),
       freelancerStats,
-      settlements
+      settlements: finalSettlements
     };
-  }, [filteredProjects, filteredFixedCosts, freelancers, filteredTransactions, dateRange]);
+  }, [filteredProjects, filteredFixedCosts, freelancers, filteredTransactions, dateRange, profile]);
 
   const setPresetRange = (type: 'week' | 'month' | 'year' | 'lastYear') => {
     const now = new Date();
@@ -599,8 +813,110 @@ export default function App() {
     e.currentTarget.reset();
   };
 
-  const deleteProject = (id: string) => setProjects(projects.filter(p => p.id !== id));
-  const deleteTransaction = (id: string) => setTransactions(transactions.filter(t => t.id !== id));
+  const deleteProject = async (id: string) => {
+    if (profile?.role !== 'SUPERADMIN') {
+      setErrorToast('Doar un SUPERADMIN poate șterge proiecte.');
+      return;
+    }
+    
+    const projectToDelete = projects.find(p => p.id === id);
+    if (!projectToDelete) return;
+
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Șterge Proiect',
+      message: `Sigur vrei să ștergi proiectul "${projectToDelete.title}"? Această acțiune va șterge și toate tranzacțiile interne asociate.`,
+      onConfirm: async () => {
+        try {
+          const { error: pError } = await supabase.from('projects').delete().eq('id', id);
+          if (pError) throw pError;
+
+          if (projectToDelete.contractNumber) {
+            await supabase.from('transactions').delete().eq('contractNumber', projectToDelete.contractNumber);
+          }
+
+          setProjects(prev => prev.filter(p => p.id !== id));
+          setTransactions(prev => prev.filter(t => t.contractNumber !== projectToDelete.contractNumber));
+          setDbStatus('success');
+        } catch (error: any) {
+          console.error('Error deleting project:', error);
+          setErrorToast('Eroare la ștergerea proiectului: ' + error.message);
+          setDbStatus('error');
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
+  };
+
+  const deleteTransaction = async (id: string) => {
+    if (profile?.role !== 'SUPERADMIN') {
+      setErrorToast('Doar un SUPERADMIN poate șterge tranzacții.');
+      return;
+    }
+    
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Șterge Tranzacție',
+      message: 'Sigur vrei să ștergi această tranzacție?',
+      onConfirm: async () => {
+        try {
+          const { error } = await supabase.from('transactions').delete().eq('id', id);
+          if (error) throw error;
+          setTransactions(prev => prev.filter(t => t.id !== id));
+        } catch (error: any) {
+          setErrorToast('Eroare la ștergere: ' + error.message);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
+  };
+
+  const deleteFixedCost = async (id: string) => {
+    if (profile?.role !== 'SUPERADMIN') {
+      setErrorToast('Doar un SUPERADMIN poate șterge cheltuieli.');
+      return;
+    }
+    
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Șterge Cheltuială',
+      message: 'Sigur vrei să ștergi această cheltuială?',
+      onConfirm: async () => {
+        try {
+          const { error } = await supabase.from('fixed_costs').delete().eq('id', id);
+          if (error) throw error;
+          setFixedCosts(prev => prev.filter(c => c.id !== id));
+        } catch (error: any) {
+          console.error('Error deleting fixed cost:', error);
+          setErrorToast('Eroare la ștergere: ' + error.message);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
+  };
+
+  const deleteFreelancer = async (id: string) => {
+    if (profile?.role !== 'SUPERADMIN') {
+      setErrorToast('Doar un SUPERADMIN poate șterge membri.');
+      return;
+    }
+    
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Șterge Membru',
+      message: 'Sigur vrei să ștergi acest membru?',
+      onConfirm: async () => {
+        try {
+          const { error } = await supabase.from('freelancers').delete().eq('id', id);
+          if (error) throw error;
+          setFreelancers(prev => prev.filter(f => f.id !== id));
+        } catch (error: any) {
+          setErrorToast('Eroare la ștergere: ' + error.message);
+        }
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+    });
+  };
 
   const updateProject = (id: string, updated: Partial<ExternalProject>) => {
     setProjects(projects.map(p => p.id === id ? { ...p, ...updated } as ExternalProject : p));
@@ -624,41 +940,155 @@ export default function App() {
     }
   };
 
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
+        <Loader2 className="text-indigo-600 animate-spin" size={48} />
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <Auth onLogin={handleLogin} />;
+  }
+
   return (
     <div className="min-h-screen flex flex-col lg:flex-row">
+      {/* Custom Confirmation Dialog */}
+      {confirmDialog.isOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-sm w-full shadow-2xl"
+          >
+            <div className="flex items-center gap-3 text-rose-500 mb-4">
+              <div className="w-10 h-10 bg-rose-500/10 rounded-full flex items-center justify-center">
+                <Trash2 size={20} />
+              </div>
+              <h3 className="text-lg font-bold text-white">{confirmDialog.title}</h3>
+            </div>
+            <p className="text-zinc-400 text-sm mb-6 leading-relaxed">
+              {confirmDialog.message}
+            </p>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                className="flex-1 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl text-sm font-bold transition-colors"
+              >
+                Anulează
+              </button>
+              <button 
+                onClick={confirmDialog.onConfirm}
+                className="flex-1 px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-sm font-bold transition-colors"
+              >
+                Confirmă
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* Error Toast */}
+      {errorToast && (
+        <div className="fixed bottom-8 right-8 z-[100]">
+          <motion.div 
+            initial={{ y: 20, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            className="bg-rose-600 text-white px-6 py-3 rounded-xl shadow-xl flex items-center gap-3"
+          >
+            <span className="text-sm font-bold">{errorToast}</span>
+            <button onClick={() => setErrorToast(null)} className="p-1 hover:bg-white/10 rounded">
+              <X size={16} />
+            </button>
+          </motion.div>
+        </div>
+      )}
+
       {/* Sidebar */}
       <aside className="w-full lg:w-72 bg-zinc-900 text-zinc-400 p-6 flex flex-col gap-8 border-r border-zinc-800">
-        <div className="flex items-center gap-3 text-white">
-          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center">
-            <Calculator className="text-white" />
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3 text-white">
+            <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center">
+              <Calculator className="text-white" />
+            </div>
+            <div>
+              <h1 className="font-bold text-base leading-tight">Alt Nivel</h1>
+              <p className="text-[10px] uppercase tracking-widest opacity-50">Studio Manager</p>
+            </div>
           </div>
-          <div>
-            <h1 className="font-bold text-base leading-tight">Alt Nivel</h1>
-            <p className="text-[10px] uppercase tracking-widest opacity-50">Studio Manager</p>
-          </div>
+          <button 
+            onClick={handleLogout}
+            className="p-2 hover:bg-zinc-800 rounded-lg transition-colors text-zinc-500 hover:text-white"
+            title="Deconectare"
+          >
+            <LogOut size={18} />
+          </button>
         </div>
 
         <div className="space-y-4">
-          <div className="p-4 bg-indigo-600/10 rounded-xl border border-indigo-500/20">
-            <p className="text-[10px] uppercase font-bold text-indigo-400 mb-1">Status Hub</p>
-            <p className={`text-lg font-mono font-bold ${stats.hubBalance >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {stats.hubBalance.toLocaleString()} RON
-            </p>
-            <div className="mt-3 space-y-2 border-t border-zinc-800 pt-3">
-              {freelancers.filter(f => f.id !== 'hub').map(f => {
-                const balance = stats.freelancerStats[f.id]?.netPosition || 0;
-                if (Math.abs(balance) < 1) return null;
-                return (
-                  <div key={f.id} className="flex justify-between items-center text-[10px]">
-                    <span className="truncate max-w-[100px]">{f.name}</span>
-                    <span className={`font-mono font-bold ${balance >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-                      {balance > 0 ? '+' : ''}{balance.toLocaleString()}
-                    </span>
-                  </div>
-                );
-              })}
+          <div className="px-4 py-3 bg-zinc-800/50 rounded-xl border border-zinc-700/50">
+            <div className="flex items-center gap-2 mb-1">
+              <Shield size={12} className="text-indigo-400" />
+              <span className="text-[9px] uppercase font-bold text-zinc-500">Contul tau</span>
             </div>
+            <p className="text-xs text-white font-medium truncate">{(profile as any)?.name || profile?.email}</p>
+            <p className="text-[9px] uppercase font-bold text-indigo-400 mt-1">{profile?.role}</p>
           </div>
+
+          <div className="px-4 py-2 flex items-center gap-2 border-b border-zinc-800/50 mb-2">
+            <div className={`w-2 h-2 rounded-full ${
+              dbStatus === 'success' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 
+              dbStatus === 'syncing' ? 'bg-amber-500 animate-pulse' : 
+              dbStatus === 'error' ? 'bg-rose-500' : 'bg-zinc-600'
+            }`} />
+            <span className="text-[10px] uppercase font-bold tracking-wider">
+              {dbStatus === 'success' ? 'Baza de date conectata' : 
+               dbStatus === 'syncing' ? 'Sincronizare...' : 
+               dbStatus === 'error' ? 'Eroare conexiune' : 'Asteptare...'}
+            </span>
+            {profile?.role !== 'COLLABORATOR' && (
+              <button 
+                onClick={() => fetchData()} 
+                className="ml-auto p-1 hover:bg-zinc-800 rounded transition-colors"
+                title="Reincarca datele din Supabase"
+              >
+                <RefreshCw size={10} className={dbStatus === 'syncing' ? 'animate-spin' : ''} />
+              </button>
+            )}
+          </div>
+
+          {profile?.role !== 'COLLABORATOR' && (
+            <div className="p-4 bg-indigo-600/10 rounded-xl border border-indigo-500/20">
+              <p className="text-[10px] uppercase font-bold text-indigo-400 mb-1">Status Hub</p>
+              <p className={`text-lg font-mono font-bold ${stats.hubBalance >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {stats.hubBalance.toLocaleString()} RON
+              </p>
+              <div className="mt-3 space-y-2 border-t border-zinc-800 pt-3">
+                {freelancers.filter(f => f.id !== 'hub').map(f => {
+                  const balance = stats.freelancerStats[f.id]?.netPosition || 0;
+                  if (Math.abs(balance) < 1) return null;
+                  return (
+                    <div key={f.id} className="flex justify-between items-center text-[10px]">
+                      <span className="truncate max-w-[100px]">{f.name}</span>
+                      <span className={`font-mono font-bold ${balance >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                        {balance > 0 ? '+' : ''}{balance.toLocaleString()}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {profile?.role === 'COLLABORATOR' && profile.freelancer_id && (
+            <div className="p-4 bg-emerald-600/10 rounded-xl border border-emerald-500/20">
+              <p className="text-[10px] uppercase font-bold text-emerald-400 mb-1">Balanța Ta</p>
+              <p className={`text-lg font-mono font-bold ${stats.freelancerStats[profile.freelancer_id]?.netPosition >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {stats.freelancerStats[profile.freelancer_id]?.netPosition.toLocaleString()} RON
+              </p>
+            </div>
+          )}
 
           <p className="text-[10px] uppercase font-bold text-zinc-600 px-4">Filtreaza Perioada</p>
           <div className="px-4 space-y-3">
@@ -692,46 +1122,59 @@ export default function App() {
         <nav className="flex flex-col gap-2">
           <button 
             onClick={() => setActiveTab('dashboard')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
           >
             <TrendingUp size={18} />
             <span className="text-sm font-medium">Dashboard</span>
           </button>
-          <button 
-            onClick={() => setActiveTab('projects')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'projects' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
-          >
-            <Briefcase size={18} />
-            <span className="text-sm font-medium">Proiecte Externe</span>
-          </button>
+          
+          {profile?.role !== 'COLLABORATOR' && (
+            <button 
+              onClick={() => setActiveTab('projects')}
+              className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'projects' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            >
+              <Briefcase size={18} />
+              <span className="text-sm font-medium">Proiecte Externe</span>
+            </button>
+          )}
+
           <button 
             onClick={() => setActiveTab('internal')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'internal' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'internal' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
           >
             <ArrowRightLeft size={18} />
             <span className="text-sm font-medium">Tranzactii Interne</span>
           </button>
-          <button 
-            onClick={() => setActiveTab('costs')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'costs' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
-          >
-            <Receipt size={18} />
-            <span className="text-sm font-medium">Cheltuieli Fixe</span>
-          </button>
-          <button 
-            onClick={() => setActiveTab('team')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'team' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
-          >
-            <Users size={18} />
-            <span className="text-sm font-medium">Echipa</span>
-          </button>
-          <button 
-            onClick={() => setActiveTab('settings')}
-            className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'settings' ? 'bg-zinc-800 text-white' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
-          >
-            <Settings size={18} />
-            <span className="text-sm font-medium">Setari</span>
-          </button>
+
+          {profile?.role !== 'COLLABORATOR' && (
+            <button 
+              onClick={() => setActiveTab('costs')}
+              className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'costs' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            >
+              <Receipt size={18} />
+              <span className="text-sm font-medium">Cheltuieli Fixe</span>
+            </button>
+          )}
+
+          {profile?.role !== 'COLLABORATOR' && (
+            <button 
+              onClick={() => setActiveTab('team')}
+              className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'team' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            >
+              <Users size={18} />
+              <span className="text-sm font-medium">Echipa</span>
+            </button>
+          )}
+
+          {profile?.role === 'SUPERADMIN' && (
+            <button 
+              onClick={() => setActiveTab('settings')}
+              className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-all ${activeTab === 'settings' ? 'bg-zinc-800 text-white shadow-lg' : 'hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+            >
+              <Settings size={18} />
+              <span className="text-sm font-medium">Setari</span>
+            </button>
+          )}
         </nav>
       </aside>
 
@@ -751,63 +1194,67 @@ export default function App() {
                 <p className="text-zinc-500">Sumar al activitatii hub-ului pentru perioada {dateRange.start} - {dateRange.end}.</p>
               </header>
 
-              {/* Fixed Costs Section at Top */}
-              <section className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-lg font-bold flex items-center gap-2">
-                    <Receipt size={20} className="text-indigo-600" />
-                    Cheltuieli Fixe & Balanta Hub
-                  </h3>
-                  <div className={`px-4 py-1 rounded-full text-sm font-bold font-mono ${stats.hubBalance >= 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
-                    Balanta: {stats.hubBalance.toLocaleString()} RON
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <div className="card p-4 bg-zinc-50 border-zinc-200">
-                    <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Total Cheltuieli</p>
-                    <p className="text-xl font-bold font-mono text-rose-600">{stats.totalFixedCosts.toLocaleString()} RON</p>
-                  </div>
-                  <div className="card p-4 bg-zinc-50 border-zinc-200">
-                    <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Contributii Proiecte</p>
-                    <p className="text-xl font-bold font-mono text-indigo-600">{stats.totalHubContributions.toLocaleString()} RON</p>
-                  </div>
-                  <div className="lg:col-span-2 card p-4 flex flex-wrap gap-x-6 gap-y-2">
-                    {filteredFixedCosts.map(c => (
-                      <div key={c.id} className="flex items-center gap-2 text-xs">
-                        <span className="w-2 h-2 rounded-full bg-zinc-300"></span>
-                        <span className="text-zinc-500">{c.name}:</span>
-                        <span className="font-mono font-bold">{c.amount.toLocaleString()}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                {stats.hubBalance < 0 && (
-                  <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-sm flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <TrendingDown size={16} />
-                      <span><strong>Deficit Hub:</strong> Hub-ul are un deficit de <strong>{Math.abs(stats.hubBalance).toLocaleString()} RON</strong> pentru perioada selectata.</span>
+              {/* Fixed Costs Section at Top - Hidden for Collaborators */}
+              {profile?.role !== 'COLLABORATOR' && (
+                <section className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-bold flex items-center gap-2">
+                      <Receipt size={20} className="text-indigo-600" />
+                      Cheltuieli Fixe & Balanta Hub
+                    </h3>
+                    <div className={`px-4 py-1 rounded-full text-sm font-bold font-mono ${stats.hubBalance >= 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700'}`}>
+                      Balanta: {stats.hubBalance.toLocaleString()} RON
                     </div>
                   </div>
-                )}
-              </section>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="card p-4 bg-zinc-50 border-zinc-200">
+                      <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Total Cheltuieli</p>
+                      <p className="text-xl font-bold font-mono text-rose-600">{stats.totalFixedCosts.toLocaleString()} RON</p>
+                    </div>
+                    <div className="card p-4 bg-zinc-50 border-zinc-200">
+                      <p className="text-[10px] font-bold text-zinc-500 uppercase mb-2">Contributii Proiecte</p>
+                      <p className="text-xl font-bold font-mono text-indigo-600">{stats.totalHubContributions.toLocaleString()} RON</p>
+                    </div>
+                    <div className="lg:col-span-2 card p-4 flex flex-wrap gap-x-6 gap-y-2">
+                      {filteredFixedCosts.map(c => (
+                        <div key={c.id} className="flex items-center gap-2 text-xs">
+                          <span className="w-2 h-2 rounded-full bg-zinc-300"></span>
+                          <span className="text-zinc-500">{c.name}:</span>
+                          <span className="font-mono font-bold">{c.amount.toLocaleString()}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {stats.hubBalance < 0 && (
+                    <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 text-sm flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <TrendingDown size={16} />
+                        <span><strong>Deficit Hub:</strong> Hub-ul are un deficit de <strong>{Math.abs(stats.hubBalance).toLocaleString()} RON</strong> pentru perioada selectata.</span>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="card p-6">
-                  <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Venituri Totale Proiecte</p>
-                  <p className="text-2xl font-bold font-mono">{stats.totalExternalIncome.toLocaleString()} RON</p>
-                  <div className="mt-2 flex items-center gap-1 text-emerald-600 text-xs font-medium">
-                    <TrendingUp size={14} />
-                    <span>Valoare bruta contractata</span>
+              {profile?.role !== 'COLLABORATOR' && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="card p-6">
+                    <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Venituri Totale Proiecte</p>
+                    <p className="text-2xl font-bold font-mono">{stats.totalExternalIncome.toLocaleString()} RON</p>
+                    <div className="mt-2 flex items-center gap-1 text-emerald-600 text-xs font-medium">
+                      <TrendingUp size={14} />
+                      <span>Valoare bruta contractata</span>
+                    </div>
+                  </div>
+                  <div className="card p-6 bg-zinc-900 text-white border-none">
+                    <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Status General</p>
+                    <p className="text-2xl font-bold font-mono text-indigo-400">
+                      {filteredProjects.length} Proiecte / {filteredTransactions.length} Tranzactii
+                    </p>
+                    <p className="text-xs text-zinc-500 mt-2">Activitate in perioada selectata</p>
                   </div>
                 </div>
-                <div className="card p-6 bg-zinc-900 text-white border-none">
-                  <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Status General</p>
-                  <p className="text-2xl font-bold font-mono text-indigo-400">
-                    {filteredProjects.length} Proiecte / {filteredTransactions.length} Tranzactii
-                  </p>
-                  <p className="text-xs text-zinc-500 mt-2">Activitate in perioada selectata</p>
-                </div>
-              </div>
+              )}
 
               <section className="space-y-4">
                 <h3 className="text-lg font-bold flex items-center gap-2">
@@ -820,38 +1267,49 @@ export default function App() {
                       <thead>
                         <tr className="bg-zinc-50 border-b border-zinc-100">
                           <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider">Membru</th>
-                          <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider text-right">Venituri Externe (Lead)</th>
+                          {profile?.role !== 'COLLABORATOR' && (
+                            <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider text-right">Venituri Externe (Lead)</th>
+                          )}
                           <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider text-right">De incasat (Intern)</th>
                           <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider text-right">De platit (Intern)</th>
                           <th className="p-4 text-[10px] font-bold uppercase text-zinc-500 tracking-wider text-right">Net Final</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-zinc-100">
-                        {freelancers.map(f => {
-                          const fStats = stats.freelancerStats[f.id];
-                          return (
-                            <tr key={f.id} className="hover:bg-zinc-50 transition-colors text-sm">
-                              <td className="p-4">
-                                <p className="font-semibold">{f.name}</p>
-                                <p className="text-[10px] text-zinc-500 uppercase">{f.role}</p>
-                              </td>
-                              <td className="p-4 font-mono text-emerald-600 text-right">
-                                {fStats.externalIncome > 0 ? `+${fStats.externalIncome.toLocaleString()}` : '-'}
-                              </td>
-                              <td className="p-4 font-mono text-emerald-600 text-right">
-                                {fStats.internalReceivable > 0 ? `+${fStats.internalReceivable.toLocaleString()}` : '-'}
-                              </td>
-                              <td className="p-4 font-mono text-rose-600 text-right">
-                                {fStats.internalPayable > 0 ? `-${fStats.internalPayable.toLocaleString()}` : '-'}
-                              </td>
-                              <td className="p-4 font-mono font-bold text-right">
-                                <span className={fStats.netPosition >= 0 ? 'text-emerald-700' : 'text-rose-700'}>
-                                  {fStats.netPosition.toLocaleString()} RON
-                                </span>
-                              </td>
-                            </tr>
-                          );
-                        })}
+                        {freelancers
+                          .filter(f => {
+                            if (profile?.role === 'COLLABORATOR' && profile.freelancer_id) {
+                              return f.id === profile.freelancer_id;
+                            }
+                            return true;
+                          })
+                          .map(f => {
+                            const fStats = stats.freelancerStats[f.id];
+                            return (
+                              <tr key={f.id} className="hover:bg-zinc-50 transition-colors text-sm">
+                                <td className="p-4">
+                                  <p className="font-semibold">{f.name}</p>
+                                  <p className="text-[10px] text-zinc-500 uppercase">{f.role}</p>
+                                </td>
+                                {profile?.role !== 'COLLABORATOR' && (
+                                  <td className="p-4 font-mono text-emerald-600 text-right">
+                                    {fStats.externalIncome > 0 ? `+${fStats.externalIncome.toLocaleString()}` : '-'}
+                                  </td>
+                                )}
+                                <td className="p-4 font-mono text-emerald-600 text-right">
+                                  {fStats.internalReceivable > 0 ? `+${fStats.internalReceivable.toLocaleString()}` : '-'}
+                                </td>
+                                <td className="p-4 font-mono text-rose-600 text-right">
+                                  {fStats.internalPayable > 0 ? `-${fStats.internalPayable.toLocaleString()}` : '-'}
+                                </td>
+                                <td className="p-4 font-mono font-bold text-right">
+                                  <span className={fStats.netPosition >= 0 ? 'text-emerald-700' : 'text-rose-700'}>
+                                    {fStats.netPosition.toLocaleString()} RON
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })}
                       </tbody>
                     </table>
                   </div>
@@ -1197,12 +1655,14 @@ export default function App() {
                                       >
                                         <Edit2 size={16} />
                                       </button>
-                                      <button 
-                                        onClick={() => deleteProject(p.id)}
-                                        className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
-                                      >
-                                        <Trash2 size={16} />
-                                      </button>
+                                      {profile?.role === 'SUPERADMIN' && (
+                                        <button 
+                                          onClick={() => deleteProject(p.id)}
+                                          className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
+                                        >
+                                          <Trash2 size={16} />
+                                        </button>
+                                      )}
                                     </div>
                                   </td>
                                 </tr>
@@ -1421,12 +1881,14 @@ export default function App() {
                                     >
                                       <Edit2 size={16} />
                                     </button>
-                                    <button 
-                                      onClick={() => deleteTransaction(t.id)}
-                                      className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
-                                    >
-                                      <Trash2 size={16} />
-                                    </button>
+                                    {profile?.role === 'SUPERADMIN' && (
+                                      <button 
+                                        onClick={() => deleteTransaction(t.id)}
+                                        className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
+                                      >
+                                        <Trash2 size={16} />
+                                      </button>
+                                    )}
                                   </div>
                                 </td>
                               </tr>
@@ -1582,12 +2044,14 @@ export default function App() {
                                     >
                                       <Edit2 size={16} />
                                     </button>
-                                    <button 
-                                      onClick={() => setFixedCosts(fixedCosts.filter(item => item.id !== c.id))}
-                                      className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
-                                    >
-                                      <Trash2 size={16} />
-                                    </button>
+                                    {profile?.role === 'SUPERADMIN' && (
+                                      <button 
+                                        onClick={() => deleteFixedCost(c.id)}
+                                        className="p-2 text-zinc-400 hover:text-rose-600 transition-colors"
+                                      >
+                                        <Trash2 size={16} />
+                                      </button>
+                                    )}
                                   </div>
                                 </td>
                               </tr>
@@ -1681,9 +2145,14 @@ export default function App() {
                       <button onClick={() => setEditingFreelancer(f)} className="p-2 bg-zinc-100 rounded-lg text-zinc-600 hover:bg-zinc-200">
                         <Edit2 size={14} />
                       </button>
-                      <button onClick={() => setFreelancers(freelancers.filter(item => item.id !== f.id))} className="p-2 bg-rose-50 rounded-lg text-rose-600 hover:bg-rose-100">
-                        <Trash2 size={14} />
-                      </button>
+                      {profile?.role === 'SUPERADMIN' && (
+                        <button 
+                          onClick={() => deleteFreelancer(f.id)} 
+                          className="p-2 bg-rose-50 rounded-lg text-rose-600 hover:bg-rose-100"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
                     </div>
                     <div className="w-20 h-20 bg-zinc-100 rounded-full flex items-center justify-center text-zinc-400">
                       <Users size={40} />
@@ -1715,6 +2184,22 @@ export default function App() {
                 <h2 className="text-3xl font-bold tracking-tight">Setari Aplicatie</h2>
                 <p className="text-zinc-500">Configurari si importuri de date.</p>
               </header>
+
+              <div className="card p-8 space-y-6">
+                <h3 className="font-bold flex items-center gap-2">
+                  <Shield className="text-indigo-600" size={20} />
+                  Management Utilizatori (RBAC)
+                </h3>
+                
+                <div className="space-y-6">
+                  <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl text-amber-800 text-xs">
+                    <p className="font-bold mb-1">Nota pentru Superadmin:</p>
+                    <p>Utilizatorii noi apar aici dupa ce isi creeaza cont. Poti sa le schimbi rolul si sa ii asociezi cu un membru din echipa pentru a le filtra datele.</p>
+                  </div>
+
+                  <UserManagement freelancers={freelancers} />
+                </div>
+              </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 <div className="card p-8 space-y-6">

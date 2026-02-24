@@ -65,3 +65,12 @@ export interface MonthlySettlement {
   balance: number; // hubContributions - fixedCosts
   freelancerBalances: Record<string, number>; // Net position for each freelancer
 }
+
+export type UserRole = 'SUPERADMIN' | 'ADMIN' | 'COLLABORATOR';
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  role: UserRole;
+  freelancer_id?: string;
+}
